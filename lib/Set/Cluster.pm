@@ -28,11 +28,11 @@ use warnings;
 
 use Carp;
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
 sub new {
 	my $class = shift;
-	my $self = { results => {} };
+	my $self = { results => {}, node_name_lookup => {}, item_lookup => {}, item_type => "" };
 	return bless $self, $class;
 }
 
@@ -40,7 +40,20 @@ sub setup {
 	my $self = shift;
 	my %args = @_;
 	$self->{nodes} = $args{nodes} || croak "No nodes specified";
-	$self->{items} = $args{items} || croak "No items specified";
+	$args{items} || croak "No items specified";
+	if (ref $args{items} eq "ARRAY") {
+		$self->{item_type} = "ARRAY";
+		foreach my $object (@{$args{items}}) {
+			$self->{item_lookup}->{"$object"} = $object;
+			$object->can("weight") or croak "Object $object does not have a weight method";
+			$self->{items}->{"$object"} = $object->weight;
+		}
+	} elsif (ref $args{items} eq "HASH") {
+		$self->{item_type} = "HASH";
+		$self->{items} = $args{items};
+	} else {
+		croak "items is not correct type: ".ref $args{items};
+	}
 }
 
 sub results { shift->{results}; }
@@ -54,7 +67,9 @@ sub calculate {
 	# Setup nodes and distribute first time
 	my $result = Set::Cluster::Result->new;
 	foreach my $n (@{$self->{nodes}}) {
-		$result->{$n} = [];
+		my $stringified = "$n";
+		$self->{node_name_lookup}->{$stringified} = $n;
+		$result->{$stringified} = [];
 	}
 	$self->distribute($result, [keys %{$self->{items}}]);
 
@@ -107,14 +122,21 @@ sub lowest {
 sub items {
 	my $self = shift;
 	my %args = @_;
-	return @{$self->results->{$args{fail}}->{$args{node}}};
+	$args{fail} = $args{fail} || "";
+	my $scenario = "$args{fail}";
+	my $node = "$args{node}" || croak "Must specify node";
+	if ($self->{item_type} eq "HASH") {
+		return @{$self->results->{$scenario}->{$node}};
+	} else {
+		return map {$_ = $self->{item_lookup}->{$_}} @{$self->results->{$scenario}->{$node}};
+	}
 }
 
 sub takeover {
 	my $self = shift;
 	my %args = @_;
-	my $node = $args{node};
-	my @fail = split (",", $args{fail});
+	my $node = "$args{node}" || croak "Must specify node";
+	my @fail = split (",", "$args{fail}");
 	pop @fail;
 	my $fail = join(",", @fail);
 	my $prior = $self->results->{$fail}->{$node};
@@ -124,9 +146,26 @@ sub takeover {
 	map {$seen{$_}--} @$prior;
 	my @result = ();
 	map { push @result, $_ if $seen{$_}==1 } keys %seen;
-	return @result;
+	if ($self->{item_type} eq "HASH") {
+		return @result;
+	} else {
+		return map { $_ = $self->{item_lookup}->{$_}} @result;
+	}
 }
 
+sub hash_by_item {
+	my $self = shift;
+	my %args = @_;
+	my $fail = $args{fail} || "";
+	my $hash = {};
+	foreach my $node (keys %{$self->results->{$fail}}) {
+		my $items = $self->results->{$fail}->{$node};
+		foreach my $i (@{$items}) {
+			$hash->{$i} = $self->{node_name_lookup}->{$node};
+		}
+	}
+	return $hash;
+}
 
 1;
 __END__
@@ -143,11 +182,14 @@ Set::Cluster - Distribute items across nodes in a load balanced way and show tak
   $c = Set::Cluster->new;
   $c->setup( nodes => [qw(A B C)], items => $h );
   $c->calculate(2);		# Go 2 levels deep
-  $results = $c->results;	# Returns a hash with how items are split across the nodes
 
-  # Convenience functions to parse $c->results
+  # Functions to parse $c->results
   @takeover = $c->takeover( node => "A", fail => "C" );	# Items taken over due to a failure of C
   @items = $c->items( node => "A", fail => "B" );	# All items for A, when B has failed
+  $node = $c->hash_by_item( fail => "" );		# Returns a hash where $node->{$item} returns the node name
+
+  $results = $c->results;	# Returns a hash with how items are split across the nodes
+				# This structure may change in future
 
 =head1 DESCRIPTION
 
@@ -177,10 +219,28 @@ I'd love to hear.
 
 Sets the list of nodes and all the items.
 
+=item setup( nodes => [objects], items => [objects] )
+
+Sets the list of nodes and items. The only restriction for the item objects is that it must
+support a weight method, in order to get the weight value of each object.
+
 =item calculate(levels)
 
 Works out all the possible failure scenarios. A level of 0 means just distribute,
 a level of 1 works out a single point of failure scenario, etc.
+
+=item takeover( node => $name, fail => $scenario )
+
+Returns an unordered list of items that were added to the specified node at the failure scenario specified.
+
+=item items( node => $name, fail => $scenario )
+
+Returns an unordered list of items that the specified node has at the time of the failure
+scenario.
+
+=item hash_by_item( fail => "scenario" )
+
+Returns a hash ref where the index is item with value of node.
 
 =item results
 
@@ -214,16 +274,15 @@ Returns the hash ref holding all the results. The structure is:
 The first section shows a distribution with no failures. The second section is what happens when
 node A fails. If there is more than one failure, the key will be "failure1,failure2".
 
-=item takeover( node => $name, fail => $scenario )
-
-Returns an unordered list of items that were added to the specified node at the failure scenario specified.
-
-=item items( node => $name, fail => $scenario )
-
-Returns an unordered list of items that the specified node has at the time of the failure
-scenario.
+This is for curious minds. The preferred way to access this data is via the other methods, as this 
+structure may change in future.
 
 =back
+
+=head1 RESTRICTIONS
+
+When using objects as the node or the items, the stringification of the object must be unique,
+otherwise funny things will happen!
 
 =head1 HISTORY
 
